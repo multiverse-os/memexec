@@ -1,5 +1,18 @@
 package memexec
 
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"unsafe"
+)
+
 const maxint int64 = int64(^uint(0) >> 1)
 
 const (
@@ -17,13 +30,14 @@ func (self *Error) Error() string {
 }
 func (self *Error) Unwrap() error { return self.Err }
 
-type MemFD struct{ *os.File }
+type memFD struct{ *os.File }
 
-func (self *MemFD) Write(bytes []byte) (int, error) { return syscall.Write(int(self.Fd()), bytes) }
-func (self *MemFD) Path() string                    { return fmt.Sprintf("/proc/self/fd/%d", self.Fd()) }
+func (self *memFD) Write(bytes []byte) (int, error) { return syscall.Write(int(self.Fd()), bytes) }
+func (self *memFD) Path() string                    { return fmt.Sprintf("/proc/self/fd/%d", self.Fd()) }
 
 type Cmd struct {
-	MemFD           *MemFD
+	memFD           *memFD
+	Size            int64
 	Args            []string
 	Env             []string
 	Dir             string
@@ -53,40 +67,44 @@ func Command(bytes []byte, arg ...string) *Cmd {
 
 	cmd := &Cmd{
 		Args: append([]string{name}, arg...),
-		MemFD: &MemFD{
+		memFD: &memFD{
 			os.NewFile(fd, name),
 		},
 	}
 
+	bytesWritten, err := cmd.memFD.Write(bytes)
+	if err != nil {
+		fmt.Errorf("[error] failed to write executable bytes to memory fd:", err)
+	}
+	cmd.Size = int64(bytesWritten)
+
 	return cmd
 }
 
-func CommandContext(ctx context.Context, name string, arg ...string) *Cmd {
-	if ctx == nil {
-		panic("nil Context")
+func MemFD(fd *os.File, arg ...string) *Cmd {
+	cmd := &Cmd{
+		Args: append([]string{fd.Name()}, arg...),
+		memFD: &memFD{
+			File: fd,
+		},
 	}
-	cmd := Command(name, arg...)
+	return cmd
+}
+
+func CommandContext(ctx context.Context, bytes []byte, arg ...string) *Cmd {
+	if ctx == nil {
+		panic("[fatal] nil Context")
+	}
+	cmd := Command(bytes, arg...)
 	cmd.ctx = ctx
 	return cmd
 }
 
-func (self *Cmd) commandWithArguments() string { return append(self.MemFD.Name(), self.Args) }
-
-func (self *Cmd) String() string {
-	if self.lookPathErr != nil {
-		// failed to resolve path; report the original requested path (plus
-		// args)
-		return strings.Join(self.commandWithArguments, " ")
-	}
-	// report the exact executable path (plus args)
-	b := new(strings.Builder)
-	b.WriteString(self.Path)
-	for _, a := range self.Args[1:] {
-		b.WriteByte(' ')
-		b.WriteString(a)
-	}
-	return b.String()
+func (self *Cmd) commandWithArguments() []string {
+	return append([]string{self.memFD.Name()}, self.Args...)
 }
+
+func (self *Cmd) String() string { return strings.Join(self.commandWithArguments(), " ") }
 
 func interfaceEqual(a, b interface{}) bool {
 	defer func() {
@@ -95,7 +113,7 @@ func interfaceEqual(a, b interface{}) bool {
 	return a == b
 }
 
-func (c *Cmd) envv() []string {
+func (self *Cmd) envv() []string {
 	if self.Env != nil {
 		return self.Env
 	}
@@ -104,7 +122,7 @@ func (c *Cmd) envv() []string {
 
 var skipStdinCopyError func(error) bool
 
-func (c *Cmd) stdin() (f *os.File, err error) {
+func (self *Cmd) stdin() (f *os.File, err error) {
 	if self.Stdin == nil {
 		f, err = os.Open(os.DevNull)
 		if err != nil {
@@ -138,16 +156,16 @@ func (c *Cmd) stdin() (f *os.File, err error) {
 	return pr, nil
 }
 
-func (c *Cmd) stdout() (f *os.File, err error) { return self.writerDescriptor(self.Stdout) }
+func (self *Cmd) stdout() (f *os.File, err error) { return self.writerDescriptor(self.Stdout) }
 
-func (c *Cmd) stderr() (f *os.File, err error) {
+func (self *Cmd) stderr() (f *os.File, err error) {
 	if self.Stderr != nil && interfaceEqual(self.Stderr, self.Stdout) {
 		return self.childFiles[1], nil
 	}
 	return self.writerDescriptor(self.Stderr)
 }
 
-func (c *Cmd) writerDescriptor(w io.Writer) (f *os.File, err error) {
+func (self *Cmd) writerDescriptor(w io.Writer) (f *os.File, err error) {
 	if w == nil {
 		f, err = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 		if err != nil {
@@ -176,48 +194,24 @@ func (c *Cmd) writerDescriptor(w io.Writer) (f *os.File, err error) {
 	return pw, nil
 }
 
-func (c *Cmd) closeDescriptors(closers []io.Closer) {
+func (self *Cmd) closeDescriptors(closers []io.Closer) {
 	for _, fd := range closers {
 		fd.Close()
 	}
 }
 
-func (c *Cmd) Run() error {
+func (self *Cmd) Run() error {
 	if err := self.Start(); err != nil {
 		return err
 	}
 	return self.Wait()
 }
 
-func lookExtensions(path, dir string) (string, error) {
-	if filepath.Base(path) == path {
-		path = filepath.Join(".", path)
-	}
-	if len(dir) == 0 {
-		return LookPath(path)
-	} else if len(filepath.VolumeName(path)) != 0 {
-		return LookPath(path)
-	} else if len(path) > 1 && os.IsPathSeparator(path[0]) {
-		return LookPath(path)
-	}
-	dirandpath := filepath.Join(dir, path)
-	// We assume that LookPath will only add file extension.
-	lp, err := LookPath(dirandpath)
-	if err != nil {
-		return "", err
-	}
-	ext := strings.TrimPrefix(lp, dirandpath)
-	return path + ext, nil
-}
-
 func (self *Cmd) Start() error {
-	if self.lookPathErr != nil {
-		self.closeDescriptors(self.closeAfterStart)
-		self.closeDescriptors(self.closeAfterWait)
-		return self.lookPathErr
-	} else if self.Process != nil {
-		return errors.New("[memexec] already started")
-	} else if self.ctx != nil {
+	if self.Process != nil {
+		return fmt.Errorf("[memexec] already started")
+	}
+	if self.ctx != nil {
 		select {
 		case <-self.ctx.Done():
 			self.closeDescriptors(self.closeAfterStart)
@@ -225,12 +219,16 @@ func (self *Cmd) Start() error {
 			return self.ctx.Err()
 		default:
 		}
+	} else {
+		self.closeDescriptors(self.closeAfterStart)
+		self.closeDescriptors(self.closeAfterWait)
+		return self.lookPathErr
 	}
 
 	self.childFiles = make([]*os.File, 0, 3+len(self.ExtraFiles))
 	type F func(*Cmd) (*os.File, error)
 	for _, setupFd := range []F{(*Cmd).stdin, (*Cmd).stdout, (*Cmd).stderr} {
-		fd, err := setupFd(c)
+		fd, err := setupFd(self)
 		if err != nil {
 			self.closeDescriptors(self.closeAfterStart)
 			self.closeDescriptors(self.closeAfterWait)
@@ -242,7 +240,7 @@ func (self *Cmd) Start() error {
 
 	var err error
 	self.Process, err = os.StartProcess(
-		self.MemFD.Path(),
+		self.memFD.Path(),
 		self.commandWithArguments(),
 		&os.ProcAttr{
 			Dir:   self.Dir,
@@ -288,13 +286,13 @@ type ExitError struct {
 	Stderr []byte
 }
 
-func (e *ExitError) Error() string { return e.ProcessState.String() }
+func (self *ExitError) Error() string { return self.ProcessState.String() }
 
-func (c *Cmd) Wait() error {
+func (self *Cmd) Wait() error {
 	if self.Process == nil {
-		return errors.New("[memexec] not started")
+		return fmt.Errorf("[memexec] not started")
 	} else if self.finished {
-		return errors.New("[memexec] Wait was already called")
+		return fmt.Errorf("[memexec] Wait was already called")
 	}
 	self.finished = true
 
@@ -322,12 +320,9 @@ func (c *Cmd) Wait() error {
 	return copyError
 }
 
-// Output runs the command and returns its standard output.
-// Any returned error will usually be of type *ExitError.
-// If self.Stderr was nil, Output populates ExitError.Stderr.
-func (c *Cmd) Output() ([]byte, error) {
+func (self *Cmd) Output() ([]byte, error) {
 	if self.Stdout != nil {
-		return nil, errors.New("[memexec] Stdout already set")
+		return nil, fmt.Errorf("[memexec] Stdout already set")
 	}
 	var stdout bytes.Buffer
 	self.Stdout = &stdout
@@ -346,13 +341,11 @@ func (c *Cmd) Output() ([]byte, error) {
 	return stdout.Bytes(), err
 }
 
-// CombinedOutput runs the command and returns its combined standard
-// output and standard error.
-func (c *Cmd) CombinedOutput() ([]byte, error) {
+func (self *Cmd) CombinedOutput() ([]byte, error) {
 	if self.Stdout != nil {
-		return nil, errors.New("[memexec] Stdout already set")
+		return nil, fmt.Errorf("[memexec] Stdout already set")
 	} else if self.Stderr != nil {
-		return nil, errors.New("[memexec] Stderr already set")
+		return nil, fmt.Errorf("[memexec] Stderr already set")
 	}
 	var b bytes.Buffer
 	self.Stdout = &b
@@ -361,11 +354,11 @@ func (c *Cmd) CombinedOutput() ([]byte, error) {
 	return b.Bytes(), err
 }
 
-func (c *Cmd) StdinPipe() (io.WriteCloser, error) {
+func (self *Cmd) StdinPipe() (io.WriteCloser, error) {
 	if self.Stdin != nil {
-		return nil, errors.New("[memexec] Stdin already set")
+		return nil, fmt.Errorf("[memexec] Stdin already set")
 	} else if self.Process != nil {
-		return nil, errors.New("[memexec] StdinPipe after process started")
+		return nil, fmt.Errorf("[memexec] StdinPipe after process started")
 	}
 	pr, pw, err := os.Pipe()
 	if err != nil {
@@ -380,38 +373,39 @@ func (c *Cmd) StdinPipe() (io.WriteCloser, error) {
 
 type closeOnce struct {
 	*os.File
-	once synself.Once
+	once sync.Once
 	err  error
 }
 
-func (c *closeOnce) Close() error {
+func (self *closeOnce) Close() error {
 	self.once.Do(self.close)
 	return self.err
 }
 
-func (c *closeOnce) close() { self.err = self.File.Close() }
+func (self *closeOnce) close() { self.err = self.File.Close() }
 
-func (c *Cmd) StdoutPipe() (io.ReadCloser, error) {
+func (self *Cmd) StdoutPipe() (io.ReadCloser, error) {
 	if self.Stdout != nil {
-		return nil, errors.New("[memexec] Stdout already set")
+		return nil, fmt.Errorf("[memexec] Stdout already set")
 	} else if self.Process != nil {
-		return nil, errors.New("[memexec] StdoutPipe after process started")
+		return nil, fmt.Errorf("[memexec] StdoutPipe after process started")
 	}
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		return nil, err
+	} else {
+		self.Stdout = pw
+		self.closeAfterStart = append(self.closeAfterStart, pw)
+		self.closeAfterWait = append(self.closeAfterWait, pr)
+		return pr, nil
 	}
-	self.Stdout = pw
-	self.closeAfterStart = append(self.closeAfterStart, pw)
-	self.closeAfterWait = append(self.closeAfterWait, pr)
-	return pr, nil
 }
 
-func (c *Cmd) StderrPipe() (io.ReadCloser, error) {
+func (self *Cmd) StderrPipe() (io.ReadCloser, error) {
 	if self.Stderr != nil {
-		return nil, errors.New("[memexec] Stderr already set")
+		return nil, fmt.Errorf("[memexec] Stderr already set")
 	} else if self.Process != nil {
-		return nil, errors.New("[memexec] StderrPipe after process started")
+		return nil, fmt.Errorf("[memexec] StderrPipe after process started")
 	}
 	pr, pw, err := os.Pipe()
 	if err != nil {
@@ -429,41 +423,34 @@ type prefixSuffixSaver struct {
 	suffix    []byte // ring buffer once len(suffix) == N
 	suffixOff int    // offset to write into suffix
 	skipped   int64
-	// TODO(bradfitz): we could keep one large []byte and use part of it for
-	// the prefix, reserve space for the '... Omitting N bytes ...' message,
-	// then the ring buffer suffix, and just rearrange the ring buffer
-	// suffix when Bytes() is called, but it doesn't seem worth it for
-	// now just for error messages. It's only ~64KB anyway.
 }
 
-func (w *prefixSuffixSaver) Write(p []byte) (n int, err error) {
+func (self *prefixSuffixSaver) Write(p []byte) (n int, err error) {
 	lenp := len(p)
-	p = w.fill(&w.prefix, p)
-
-	// Only keep the last w.N bytes of suffix data.
-	if overage := len(p) - w.N; overage > 0 {
+	p = self.fill(&self.prefix, p)
+	// Only keep the last self.N bytes of suffix data.
+	if overage := len(p) - self.N; overage > 0 {
 		p = p[overage:]
-		w.skipped += int64(overage)
+		self.skipped += int64(overage)
 	}
-	p = w.fill(&w.suffix, p)
-
-	// w.suffix is full now if p is non-empty. Overwrite it in a circle.
+	p = self.fill(&self.suffix, p)
+	// self.suffix is full now if p is non-empty. Overwrite it in a circle.
 	for len(p) > 0 { // 0, 1, or 2 iterations.
-		n := copy(w.suffix[w.suffixOff:], p)
+		n := copy(self.suffix[self.suffixOff:], p)
 		p = p[n:]
-		w.skipped += int64(n)
-		w.suffixOff += n
-		if w.suffixOff == w.N {
-			w.suffixOff = 0
+		self.skipped += int64(n)
+		self.suffixOff += n
+		if self.suffixOff == self.N {
+			self.suffixOff = 0
 		}
 	}
 	return lenp, nil
 }
 
 // fill appends up to len(p) bytes of p to *dst, such that *dst does not
-// grow larger than w.N. It returns the un-appended suffix of p.
-func (w *prefixSuffixSaver) fill(dst *[]byte, p []byte) (pRemain []byte) {
-	if remain := w.N - len(*dst); remain > 0 {
+// grow larger than self.N. It returns the un-appended suffix of p.
+func (self *prefixSuffixSaver) fill(dst *[]byte, p []byte) (pRemain []byte) {
+	if remain := self.N - len(*dst); remain > 0 {
 		add := minInt(len(p), remain)
 		*dst = append(*dst, p[:add]...)
 		p = p[add:]
@@ -471,20 +458,20 @@ func (w *prefixSuffixSaver) fill(dst *[]byte, p []byte) (pRemain []byte) {
 	return p
 }
 
-func (w *prefixSuffixSaver) Bytes() []byte {
-	if w.suffix == nil {
-		return w.prefix
-	} else if w.skipped == 0 {
-		return append(w.prefix, w.suffix...)
+func (self *prefixSuffixSaver) Bytes() []byte {
+	if self.suffix == nil {
+		return self.prefix
+	} else if self.skipped == 0 {
+		return append(self.prefix, self.suffix...)
 	}
 	var buf bytes.Buffer
-	buf.Grow(len(w.prefix) + len(w.suffix) + 50)
-	buf.Write(w.prefix)
+	buf.Grow(len(self.prefix) + len(self.suffix) + 50)
+	buf.Write(self.prefix)
 	buf.WriteString("\n... omitting ")
-	buf.WriteString(strconv.FormatInt(w.skipped, 10))
+	buf.WriteString(strconv.FormatInt(self.skipped, 10))
 	buf.WriteString(" bytes ...\n")
-	buf.Write(w.suffix[w.suffixOff:])
-	buf.Write(w.suffix[:w.suffixOff])
+	buf.Write(self.suffix[self.suffixOff:])
+	buf.Write(self.suffix[:self.suffixOff])
 	return buf.Bytes()
 }
 
@@ -493,4 +480,43 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func dedupEnv(env []string) []string {
+	return dedupEnvCase(env)
+}
+
+func dedupEnvCase(env []string) []string {
+	out := make([]string, 0, len(env))
+	saw := make(map[string]int, len(env)) // key => index into out
+	for _, kv := range env {
+		eq := strings.Index(kv, "=")
+		if eq < 0 {
+			out = append(out, kv)
+			continue
+		}
+		k := kv[:eq]
+		k = strings.ToLower(k)
+		if dupIdx, isDup := saw[k]; isDup {
+			out[dupIdx] = kv
+			continue
+		}
+		saw[k] = len(out)
+		out = append(out, kv)
+	}
+	return out
+}
+
+func addCriticalEnv(env []string) []string {
+	for _, kv := range env {
+		eq := strings.Index(kv, "=")
+		if eq < 0 {
+			continue
+		}
+		k := kv[:eq]
+		if strings.EqualFold(k, "SYSTEMROOT") {
+			return env
+		}
+	}
+	return append(env, "SYSTEMROOT="+os.Getenv("SYSTEMROOT"))
 }
