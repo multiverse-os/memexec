@@ -30,12 +30,16 @@ func (self *Error) Error() string {
 }
 func (self *Error) Unwrap() error { return self.Err }
 
-type memFD struct{ *os.File }
+type memFD struct {
+	*os.File
+}
 
 func (self *memFD) Write(bytes []byte) (int, error) { return syscall.Write(int(self.Fd()), bytes) }
 func (self *memFD) Path() string                    { return fmt.Sprintf("/proc/self/fd/%d", self.Fd()) }
+func (self *memFD) Info() (os.FileInfo, error)      { return os.Lstat(self.Path()) }
 
 type Cmd struct {
+	name            string
 	memFD           *memFD
 	Size            int64
 	Args            []string
@@ -61,12 +65,13 @@ type Cmd struct {
 
 // TODO: Decide if its worth putting in name "memexec" (does it see this in ps
 // aux? Or let the user set the name?
-func Command(bytes []byte, arg ...string) *Cmd {
+func Command(bytes []byte, args ...string) *Cmd {
 	name := "memexec"
 	fd, _, _ := syscall.Syscall(MFD_CREATE, uintptr(unsafe.Pointer(&name)), uintptr(MFD_CLOEXEC), 0)
 
 	cmd := &Cmd{
-		Args: append([]string{name}, arg...),
+		name: name,
+		Args: args,
 		memFD: &memFD{
 			os.NewFile(fd, name),
 		},
@@ -81,9 +86,9 @@ func Command(bytes []byte, arg ...string) *Cmd {
 	return cmd
 }
 
-func MemFD(fd *os.File, arg ...string) *Cmd {
+func MemFD(fd *os.File, args ...string) *Cmd {
 	cmd := &Cmd{
-		Args: append([]string{fd.Name()}, arg...),
+		Args: args,
 		memFD: &memFD{
 			File: fd,
 		},
@@ -101,7 +106,7 @@ func CommandContext(ctx context.Context, bytes []byte, arg ...string) *Cmd {
 }
 
 func (self *Cmd) commandWithArguments() []string {
-	return append([]string{self.memFD.Name()}, self.Args...)
+	return append([]string{self.name}, self.Args...)
 }
 
 func (self *Cmd) String() string { return strings.Join(self.commandWithArguments(), " ") }
@@ -131,11 +136,9 @@ func (self *Cmd) stdin() (f *os.File, err error) {
 		self.closeAfterStart = append(self.closeAfterStart, f)
 		return
 	}
-
 	if f, ok := self.Stdin.(*os.File); ok {
 		return f, nil
 	}
-
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		return
@@ -219,10 +222,6 @@ func (self *Cmd) Start() error {
 			return self.ctx.Err()
 		default:
 		}
-	} else {
-		self.closeDescriptors(self.closeAfterStart)
-		self.closeDescriptors(self.closeAfterWait)
-		return self.lookPathErr
 	}
 
 	self.childFiles = make([]*os.File, 0, 3+len(self.ExtraFiles))
@@ -237,11 +236,12 @@ func (self *Cmd) Start() error {
 		self.childFiles = append(self.childFiles, fd)
 	}
 	self.childFiles = append(self.childFiles, self.ExtraFiles...)
-
+	fmt.Println("arguments:", self.Args)
+	fmt.Println("arguments with command:", append([]string{self.name}, self.Args...))
 	var err error
 	self.Process, err = os.StartProcess(
 		self.memFD.Path(),
-		self.commandWithArguments(),
+		append([]string{self.name}, self.Args...),
 		&os.ProcAttr{
 			Dir:   self.Dir,
 			Files: self.childFiles,
@@ -249,12 +249,12 @@ func (self *Cmd) Start() error {
 			Sys:   self.SysProcAttr,
 		},
 	)
+
 	if err != nil {
 		self.closeDescriptors(self.closeAfterStart)
 		self.closeDescriptors(self.closeAfterWait)
 		return err
 	}
-
 	self.closeDescriptors(self.closeAfterStart)
 
 	// Don't allocate the channel unless there are goroutines to fire.
@@ -277,7 +277,6 @@ func (self *Cmd) Start() error {
 			}
 		}()
 	}
-
 	return nil
 }
 
@@ -519,4 +518,16 @@ func addCriticalEnv(env []string) []string {
 		}
 	}
 	return append(env, "SYSTEMROOT="+os.Getenv("SYSTEMROOT"))
+}
+
+func init() {
+	skipStdinCopyError = func(err error) bool {
+		// Ignore EPIPE errors copying to stdin if the program
+		// completed successfully otherwise.
+		// See Issue 9173.
+		pe, ok := err.(*os.PathError)
+		return ok &&
+			pe.Op == "write" && pe.Path == "|1" &&
+			pe.Err == syscall.EPIPE
+	}
 }
